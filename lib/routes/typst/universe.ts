@@ -1,29 +1,55 @@
-import { Route } from '@/types';
+import { load } from 'cheerio';
+import { escapeText } from 'entities';
+
+import type { Route } from '@/types';
 import ofetch from '@/utils/ofetch';
 import { parseDate } from '@/utils/parse-date';
-import { load } from 'cheerio';
-import markdownit from 'markdown-it';
-import vm from 'node:vm';
+
+function deserializeAstroProps(val: any): any {
+    if (Array.isArray(val)) {
+        const tag = val[0];
+        if (tag === 0) {
+            return val.length > 1 ? deserializeAstroProps(val[1]) : undefined;
+        }
+        if (tag === 1) {
+            return val[1].map((item) => deserializeAstroProps(item));
+        }
+        return val.map((item) => deserializeAstroProps(item));
+    }
+    if (val instanceof Object) {
+        const result = {};
+        for (const [key, v] of Object.entries(val)) {
+            result[key] = deserializeAstroProps(v);
+        }
+        return result;
+    }
+    return val;
+}
 
 interface Package {
     name: string;
     version: string;
-    entrypoint: string;
-    authors: Array<string>;
+    authors: string[];
     license: string;
     description: string;
-    repository: string;
-    keywords: Array<string>;
-    compiler: string;
-    exclude: Array<string>;
-    size: number;
-    readme: string;
-    updatedAt: number;
+    keywords?: string[];
+    updatedAt?: number;
     releasedAt: number;
+    hasRepo: boolean;
+    categories?: string[];
+    template: string | undefined;
 }
 
-interface Context {
-    an: { exports: Array<Package> };
+interface SearchResults {
+    packages: Package[];
+}
+
+function getPublicationDate(value: number | undefined): Date | undefined {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+        return;
+    }
+    const date = parseDate(value, 'X');
+    return Number.isFinite(date.getTime()) ? date : undefined;
 }
 
 export const route: Route = {
@@ -39,44 +65,24 @@ export const route: Route = {
     name: 'Universe',
     maintainers: ['HPDell'],
     handler: async () => {
-        const targetUrl = 'https://typst.app/universe/search?kind=packages%2Ctemplates&packages=last-published';
+        const targetUrl = 'https://typst.app/universe/search';
         const page = await ofetch(targetUrl);
         const $ = load(page);
-        const script = $('script')
-            .toArray()
-            .map((item) => item.attribs.src)
-            .find((item) => item && item.startsWith('/scripts/universe-search'));
-        const data: string = await ofetch(`https://typst.app${script}`, {
-            parseResponse: (txt) => txt,
-        });
-        let packages = data.match(/(an.exports=[\S\s]+);var ([$A-Z_a-z][\w$]*)=new Intl.Collator/)?.[1];
-        if (packages) {
-            packages = packages.slice(0, -2);
-            const context: Context = { an: { exports: [] } };
-            vm.createContext(context);
-            vm.runInContext(packages, context, {
-                displayErrors: true,
-            });
-            const md = markdownit('commonmark');
-            const items = context.an.exports
-                .sort((a, b) => b.updatedAt - a.updatedAt)
-                .map((item) => ({
-                    title: `${item.name} | ${item.description}`,
-                    link: `https://typst.app/universe/package/${item.name}`,
-                    description: md.render(item.readme),
-                    pubDate: parseDate(item.updatedAt, 'X'),
-                }));
-            return {
-                title: 'Typst universe',
-                link: targetUrl,
-                item: items,
-            };
-        } else {
-            return {
-                title: 'Typst universe',
-                link: targetUrl,
-                item: [],
-            };
-        }
+        const props = $('astro-island[component-export="SearchResults"]').attr('props');
+        const searchResults: SearchResults = deserializeAstroProps(JSON.parse(props!));
+        const pkgs = searchResults.packages.map((item) => ({
+            title: `${item.name} (${item.version}) | ${item.description}`,
+            link: `https://typst.app/universe/package/${item.name}`,
+            description: escapeText(item.description),
+            pubDate: getPublicationDate(item.updatedAt),
+            category: [...new Set([...(item.keywords ?? []), ...(item.categories ?? [])])],
+            author: item.authors.join(', '),
+        }));
+
+        return {
+            title: 'Typst Universe',
+            link: targetUrl,
+            item: pkgs,
+        };
     },
 };
